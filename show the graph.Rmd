@@ -1,0 +1,39 @@
+---
+title: "digging the data"
+author: "wangzhuofan"
+date: "2020/6/26"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+library the packages
+```{r}
+library(igraph)
+library(NetMix)
+```
+derive the linkage matrix
+```{r setup, include=FALSE}
+nt0 <- read.csv("C://ISBD/2020暑假/dynamic graph/week4/comm-f2f-Resistance/network/network0.csv")
+
+times <- nt0$TIME+1
+nt0 <- nt0[,-1]
+y <- array(NA,dim = c(7,7,length(times)))
+
+for (k in times) {
+  temp <- t(matrix(as.numeric(nt0[k,]),ncol = 7))
+  temp <- temp[,-1]
+  y[,,k] <- temp
+}
+```
+
+
+```{r}
+graphlist <- list()
+for (k in times) {
+  g <- graph_from_adjacency_matrix(y[,,k],mode="directed")
+  graphlist[[k]] <- g
+  plot(g)
+}
+
+```
