@@ -1,0 +1,257 @@
+---
+title: "DLSM"
+author: "wangzhuofan"
+date: "2020/7/14"
+output: html_document
+---
+
+```{r}
+library(mlegp)
+library(MASS)
+library(mvtnorm)
+library(BayesLogit)
+library(reshape2)
+library(zoo)
+```
+
+```{r setup, include=FALSE}
+nt0 <- read.csv("network0.csv")
+
+times <- nt0$TIME+1
+nt0 <- nt0[,-1]
+y <- array(NA,dim = c(7,7,length(times)))
+
+for (k in times) {
+  temp <- t(matrix(as.numeric(nt0[k,]),ncol = 7))
+  temp <- temp[,-1]
+  y[,,k] <- temp
+}
+```
+
+for the computation,we select the first 100 (time)
+
+```{r}
+times <- 1:200
+y <- y[,,times]
+
+```
+
+
+all the parameters involved are "shrinkage hyperparameter"gamma,"latent variables"x,"baseline"mu,"augmented data"w.
+```{R}
+#get function of exponential covariance matrix
+covm <- function(g,k,t1,t2){
+  res <- g*exp(-k*(t1-t2)^2)
+  return(res)
+}
+```
+
+```{R}
+#get function of gaussian process samples
+gp <- function(from,to,g,k,K,start,m){
+  t <- seq(from=from,to=to,length.out = m)
+  Sigma <- sapply(t, function(t1){
+    sapply(t, function(t2){
+      K(g,k,t1,t2)
+    })
+  })
+  path <- mvrnorm(mu = rep(0,times=m),Sigma=Sigma)
+  if(!is.null(start))
+    path <- path-path[1]+start
+  return(as.vector(path))
+}
+
+```
+
+get the functions
+
+```{r}
+#function to compute the augmented data w
+#step 1
+w_ijt <- function(mu,x,w,y){
+  murs <- w
+  for (t in T) {
+    
+    for (i in (2:n)) {
+      for (j in (1:(i-1))) {
+        w[i,j,t] <- mu[t]
+        for (h in (1:H)) {
+          w[i,j,t] <- w[i,j,t]+x[i,h,t]*x[j,h,t]
+        }
+        w[i,j,t] <- rpg(h=1,z=w[i,j,t])
+        murs[i,j,t] <- y[i,j,t]-0.5-w[i,j,t]*as.numeric(x[i,,t]%*%x[j,,t])
+      }
+    }
+  }
+  w_murs <- list("w"=w,"murs"=murs)
+  return(w_murs)
+}
+
+#function to compute baseline mu
+#step 2
+mu_t <- function(w,murs,KMU){
+  wdiag <- vector()
+  mur <-vector()
+  for (t in T) {
+    wdiag[t] <- sum(w[,,t])
+    mur[t] <- sum(murs[,,t])
+  }
+  sigmamu <- solve(diag(wdiag)+solve(KMU))
+  mumu <- sigmamu%*%mur
+  mu <- mvrnorm(mu =mumu,Sigma = sigmamu)
+  mu_wdiag <- list("mu"=mu,"wdiag"=wdiag)
+  return(mu_wdiag)
+}
+
+#function to compute new x
+#step 3
+x_ijt <- function(mu,wdiag,w,x,KX,gamma,y){
+  for (v in (1:n)) {
+    yv <- vector()
+    x_v <- vector()
+    for (i in (1:n)) {
+      
+      if(i!=v){
+        r <- vector()
+        for (h in (1:H)) {
+          temp <- diag(x[i,h,])
+          r <- cbind(r,temp)
+        }
+        yv <- c(yv,y[max(i,v),min(i,v),])
+        x_v <- rbind(x_v,r)
+      }
+       
+    }
+  
+    omega <- diag(rep(wdiag,n-1))
+    test <- t(x_v)%*%omega%*%x_v+kronecker(diag(gamma),solve(KX))
+    #while(det(test)<=1e-10){
+     # diag(test) <- diag(test)+0.01
+    #}
+    sigmav <- ginv(test)
+    muvr <- yv-kronecker(rep(1,n-1),rep(0.5,length(T)))-as.vector(omega%*%kronecker(rep(1,n-1),mu))
+    xv <- mvrnorm(mu = as.vector(sigmav%*%t(x_v)%*%muvr),Sigma = sigmav)
+    x[v,,] <- matrix(xv,ncol = length(T))
+  }
+  return(x)
+}
+
+#function to update shrinkage hyperparameters gamma
+#step 4
+v_h <- function(v,gamma,KX,x){
+  v <- rep(1,H)
+  for (l in (1:H)) {
+    for (i in (1:n)) {
+      v[1] <- v[1]+0.5*(gamma[H]/v[1])*x[i,l,]%*%solve(KX)%*%x[i,l,]
+    }
+  }
+  v[1] <- rgamma(n=1,shape = (a1+n*length(T)*H/2),rate = v[1])
+  for (h in (2:H)) {
+    for (l in (h:H)) {
+      for (i in (1:n)) {
+        v[h] <- v[h]+0.5*(gamma[H]/v[h])*x[i,l,]%*%solve(KX)%*%x[i,l,]
+      }
+    }
+    v[h] <- rgamma(n=1,shape=a2+n*length(T)*(H-h+1)/2,rate = v[h])
+  }
+  gamma <- cumprod(v)
+  v_gamma <- list("v"=v,"gamma"=gamma)
+  return(v_gamma)
+}
+
+```
+define gibbs sampling 
+```{r}
+pg_gibbs <- function(T,H,a1,a2,KX,KMU,y,iterations,v_init,gamma_init,w_init,x_init,mu_init){
+  T<-T
+  H <- H
+  a1<- a1
+  a2<- a2
+  KX <- KX
+  KMU <- KMU
+  y <- y
+  iterations <- iterations
+  v <- v_init
+  gamma <- gamma_init
+  w <- w_init
+  x <- x_init
+  mu <- mu_init
+  for (k in (1:iterations)) {
+    w_and_mur <- w_ijt(mu=mu,x=x,w=w,y=y)
+    w <- w_and_mur$w
+    murs <- w_and_mur$murs
+    mu_and_wdiag <- mu_t(w= w,murs=murs,KMU = KMU)
+    mu <- mu_and_wdiag$mu
+    wdiag <- mu_and_wdiag$wdiag
+    x <- x_ijt(mu = mu,wdiag=wdiag,w=w,x=x,KX=KX,gamma = gamma,y=y)
+    v <- v_h(v=v,gamma = gamma,KX=KX,x=x)$v
+    gamma <- v_h(v=v,gamma = gamma,KX=KX,x=x)$gamma
+  }
+  post <- list("mu"=mu,"x"=x)
+  return(post)
+}
+```
+
+
+
+```{r}
+#set parameters
+T <- times
+H <- 2
+kmu <- 0.1
+kx <- 0.1
+a1 <- 2
+a2 <- 2
+iterations <- 100
+n <- 7
+```
+
+all the parameters involved are "shrinkage hyperparameter"gamma,"latent variables"x,"baseline"mu,"augmented data"w.
+
+```{r}
+#get the prior/initial
+KMU <- sapply(T, function(t1){
+    sapply(T, function(t2){
+      covm(1,kmu,t1,t2)
+    })
+  })
+KX <- sapply(T, function(t1){
+    sapply(T, function(t2){
+      covm(1,kx,t1,t2)
+    })
+  })
+#initials
+v <- vector()
+v[1] <- rgamma(1,a1)
+v[2:H] <- rgamma((H-1),a2)
+gamma <- cumprod(v)
+w <- array(rep(0,n*n*length(T)),dim = c(n,n,length(T)))
+x <- array(rep(0,n*H*length(T)),dim = c(n,H,length(T)))
+mu <- gp(T[1],T[length(T)],1,kmu,covm,NULL,length(T))
+
+for (h in (1:H)) {
+  for (i in (1:n)) {
+    x[i,h,] <- gp(T[1],T[length(T)],1,kx,covm,NULL,length(T))
+  }
+}
+```
+
+```{r}
+result_soc <- pg_gibbs(T=T,H=H,a1=a1,a2=a2,KX=KX,KMU=KMU,y=y,iterations=iterations,v_init=v,gamma_init=gamma,w_init=w,x_init=x,mu_init=mu)
+mu_est <- result_soc$mu
+x_est <- result_soc$x
+```
+
+```{r}
+df <- data.frame("time"=times,"mu"=mu_est)
+plot(df,type = "l")
+#lines(mu,lty=3)
+#plot(mu-mu_est)
+par(mfrow=c(3,3))
+for(t in (1:9)){
+  dataf <- as.data.frame(x_est[,,t])
+  plot(dataf)
+  text(dataf)
+}
+
+```
